@@ -1,0 +1,169 @@
+# release-please keeps one release PR open in the app repo (next version + CHANGELOG.md, from the
+# Conventional Commits merged since the last release). Merging it is the release: release-please tags
+# vX.Y.Z and publishes the GitHub Release. Then this workflow promotes the image already built from that
+# release commit: once the caller's build of it has succeeded, the X.Y.Z tag is added to the same digest.
+# Nothing is rebuilt.
+#
+# It runs with the release App's token, not GITHUB_TOKEN: GitHub runs no workflows for events made with
+# GITHUB_TOKEN, so a release PR opened with it would never get its required checks.
+#
+# Caller (in the app repo), on every push to main, with release-please-config.json and
+# .release-please-manifest.json at the repo root. It must be its own workflow file, separate from the
+# one that calls build.yml: this waits for that workflow's run of the release commit to finish, which
+# never happens if this job is part of the same run.
+#   on:
+#     push:
+#       branches: [main]
+#   jobs:
+#     release:
+#       uses: kthaisociety/workflows/.github/workflows/release.yml@<tag>
+#       permissions:
+#         contents: read
+#         packages: write
+#         actions: read
+#       secrets:
+#         release-app-client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+#         release-app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      build-workflow:
+        description: File name of the caller's workflow that runs build.yml on pushes to main. Not the workflow that calls this one.
+        type: string
+        default: build.yml
+      build-timeout-minutes:
+        description: Whole minutes to wait for that build (and, later, its staging deploy) to finish.
+        type: number
+        default: 45
+    secrets:
+      release-app-client-id:
+        required: true
+      release-app-private-key:
+        required: true
+    outputs:
+      release-created:
+        description: '"true" when this run released a version.'
+        value: ${{ jobs.release-please.outputs.release-created }}
+      version:
+        description: The released version (X.Y.Z), when one was released.
+        value: ${{ jobs.release-please.outputs.version }}
+      digest:
+        description: The digest now tagged X.Y.Z, when one was released.
+        value: ${{ jobs.promote.outputs.digest }}
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ secrets.release-app-client-id }}
+          private-key: ${{ secrets.release-app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+          # release-please labels its PRs ("autorelease: pending"); labels go through the issues API.
+          permission-issues: write
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          token: ${{ steps.app.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  promote:
+    needs: release-please
+    if: needs.release-please.outputs.release-created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: read # to find the build run of the release commit
+    outputs:
+      digest: ${{ steps.tag.outputs.digest }}
+    steps:
+      - name: Wait for the release commit's build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.release-please.outputs.sha }}
+          WORKFLOW: ${{ inputs.build-workflow }}
+          TIMEOUT_MINUTES: ${{ inputs.build-timeout-minutes }}
+        run: |
+          if ! [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::build-timeout-minutes must be a whole number of minutes, got '$TIMEOUT_MINUTES'."
+            exit 1
+          fi
+          deadline=$((SECONDS + TIMEOUT_MINUTES * 60))
+          while :; do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$SHA&event=push&per_page=1" \
+              --jq '.workflow_runs[0] // empty | [.status, (.conclusion // "-"), .html_url] | @tsv')
+            if [ -n "$run" ]; then
+              IFS=$'\t' read -r status conclusion url <<<"$run"
+              if [ "$status" = completed ]; then
+                if [ "$conclusion" = success ]; then
+                  echo "Build of $SHA succeeded: $url"
+                  break
+                fi
+                echo "::error::The build of the release commit ended with '$conclusion': $url. Nothing is promoted."
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::No finished $WORKFLOW run for $SHA after $TIMEOUT_MINUTES minutes. Nothing is promoted."
+              exit 1
+            fi
+            sleep 20
+          done
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Tag the built image X.Y.Z
+        id: tag
+        env:
+          SHA: ${{ needs.release-please.outputs.sha }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          src="$image:sha-${SHA::7}"
+          dst="$image:$VERSION"
+          digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
+
+          set -o pipefail
+          want=$(digest_of "$src")
+          if [ -z "$want" ] || [ "$want" = null ]; then
+            echo "::error::$src not found in GHCR, although its build succeeded."
+            exit 1
+          fi
+          # A version tag is never moved: if it exists already, it must be this exact image.
+          if have=$(digest_of "$dst" 2>/dev/null) && [ -n "$have" ]; then
+            if [ "$have" != "$want" ]; then
+              echo "::error::$dst already exists as $have, not $want. Version tags are never moved."
+              exit 1
+            fi
+            echo "$dst already points to $want."
+          else
+            # By digest, not by the sha- tag: exactly the image checked above gets the version, even if
+            # the sha- tag were re-pushed in between.
+            docker buildx imagetools create --tag "$dst" "$image@$want"
+          fi
+
+          got=$(digest_of "$dst")
+          if [ "$got" != "$want" ]; then
+            echo "::error::$dst is $got after tagging, expected $want."
+            exit 1
+          fi
+          echo "digest=$want" >> "$GITHUB_OUTPUT"
+          echo "Released \`$dst@$want\` (built as \`$src\`)" >> "$GITHUB_STEP_SUMMARY"
