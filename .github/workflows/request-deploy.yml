@@ -1,0 +1,111 @@
+# Asks kthaisociety/deployments to deploy this repo's image tag to one environment, and waits for the
+# result: the job is green only once the app runs the image. Uses the kthais-dispatch App, which can only
+# start deployments' workflows; deployments' deploy.yml checks the request (the tag's digest, and for
+# production the GitHub Release) and does the deploy.
+#
+# Opting in is adding the job, per environment. Callers (in the app repo):
+#
+#   # build.yml: every build of main to staging
+#   deploy-staging:
+#     needs: build
+#     uses: kthaisociety/workflows/.github/workflows/request-deploy.yml@<tag>
+#     with:
+#       environment: staging
+#       tag: ${{ needs.build.outputs.tag }}
+#     secrets:
+#       dispatch-app-client-id: ${{ secrets.DISPATCH_APP_CLIENT_ID }}
+#       dispatch-app-private-key: ${{ secrets.DISPATCH_APP_PRIVATE_KEY }}
+#
+#   # release.yml: every release to production
+#   deploy-production:
+#     needs: release
+#     if: needs.release.outputs.release-created == 'true'
+#     uses: kthaisociety/workflows/.github/workflows/request-deploy.yml@<tag>
+#     with:
+#       environment: production
+#       tag: ${{ needs.release.outputs.version }}
+#     secrets: (as above)
+name: request-deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The environment in deployments, e.g. staging or production.
+        required: true
+        type: string
+      tag:
+        description: The image tag, sha-<7> or X.Y.Z.
+        required: true
+        type: string
+      project:
+        description: The project in deployments. Defaults to this repo's name.
+        type: string
+        default: ""
+      timeout-minutes:
+        description: Whole minutes to wait for the deploy.
+        type: number
+        default: 45
+    secrets:
+      dispatch-app-client-id:
+        required: true
+      dispatch-app-private-key:
+        required: true
+
+permissions: {}
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ secrets.dispatch-app-client-id }}
+          private-key: ${{ secrets.dispatch-app-private-key }}
+          owner: kthaisociety
+          repositories: deployments
+          permission-actions: write
+
+      - name: Request the deploy and wait for it
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TAG: ${{ inputs.tag }}
+          PROJECT_INPUT: ${{ inputs.project }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        run: |
+          if ! [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::timeout-minutes must be a whole number of minutes, got '$TIMEOUT_MINUTES'."
+            exit 1
+          fi
+          project=${PROJECT_INPUT:-${GITHUB_REPOSITORY#*/}}
+          project=${project,,}
+          # Unique per run, attempt and environment; deploy.yml puts it in its run name.
+          rid="${GITHUB_REPOSITORY#*/}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ENVIRONMENT"
+          rid=${rid:0:64}
+          gh workflow run deploy.yml --repo kthaisociety/deployments --ref main \
+            -f project="$project" -f environment="$ENVIRONMENT" -f tag="$TAG" -f request_id="$rid"
+          echo "Requested: $project $ENVIRONMENT $TAG ($rid)"
+
+          deadline=$((SECONDS + TIMEOUT_MINUTES * 60))
+          url=""
+          while :; do
+            run=$(R="[$rid]" gh run list --repo kthaisociety/deployments --workflow deploy.yml --limit 50 \
+              --json displayTitle,status,conclusion,url \
+              --jq '[.[] | select(.displayTitle | endswith(env.R))] | first // empty | [.status, (.conclusion // "-"), .url] | @tsv')
+            if [ -n "$run" ]; then
+              IFS=$'\t' read -r status conclusion url <<<"$run"
+              if [ "$status" = completed ]; then
+                echo "Deploy $project $ENVIRONMENT $TAG: $conclusion, $url" >> "$GITHUB_STEP_SUMMARY"
+                [ "$conclusion" = success ] && exit 0
+                echo "::error::The deploy ended with '$conclusion': $url"
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::No finished deploy after $TIMEOUT_MINUTES minutes${url:+: $url}"
+              exit 1
+            fi
+            sleep 15
+          done
