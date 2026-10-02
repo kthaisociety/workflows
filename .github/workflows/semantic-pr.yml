@@ -8,6 +8,8 @@
 #   jobs:
 #     title:
 #       uses: kthaisociety/workflows/.github/workflows/semantic-pr.yml@<tag>
+#       permissions:
+#         pull-requests: read
 name: semantic-pr
 
 on:

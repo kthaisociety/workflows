@@ -34,7 +34,7 @@ on:
         type: string
         default: build.yml
       build-timeout-minutes:
-        description: How long to wait for that build (and, later, its staging deploy) to finish.
+        description: Whole minutes to wait for that build (and, later, its staging deploy) to finish.
         type: number
         default: 45
     secrets:
@@ -98,6 +98,10 @@ jobs:
           WORKFLOW: ${{ inputs.build-workflow }}
           TIMEOUT_MINUTES: ${{ inputs.build-timeout-minutes }}
         run: |
+          if ! [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::build-timeout-minutes must be a whole number of minutes, got '$TIMEOUT_MINUTES'."
+            exit 1
+          fi
           deadline=$((SECONDS + TIMEOUT_MINUTES * 60))
           while :; do
             run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$SHA&event=push&per_page=1" \
@@ -151,7 +155,9 @@ jobs:
             fi
             echo "$dst already points to $want."
           else
-            docker buildx imagetools create --tag "$dst" "$src"
+            # By digest, not by the sha- tag: exactly the image checked above gets the version, even if
+            # the sha- tag were re-pushed in between.
+            docker buildx imagetools create --tag "$dst" "$image@$want"
           fi
 
           got=$(digest_of "$dst")
