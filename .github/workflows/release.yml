@@ -37,6 +37,13 @@ on:
         description: Whole minutes to wait for that build (and, later, its staging deploy) to finish.
         type: number
         default: 45
+      images:
+        description: >-
+          Package names under ghcr.io/<owner>/ to promote, separated by spaces or newlines, for a repo that
+          builds more than one image. Empty means the repo's name. Every one must have an image built from
+          the release commit, by the build workflow named above.
+        type: string
+        default: ""
     secrets:
       release-app-client-id:
         required: true
@@ -50,8 +57,11 @@ on:
         description: The released version (X.Y.Z), when one was released.
         value: ${{ jobs.release-please.outputs.version }}
       digest:
-        description: The digest now tagged X.Y.Z, when one was released.
+        description: The digest now tagged X.Y.Z, when one was released. With several images, the first one's.
         value: ${{ jobs.promote.outputs.digest }}
+      digests:
+        description: JSON object, image name to the digest now tagged X.Y.Z, when one was released.
+        value: ${{ jobs.promote.outputs.digests }}
 
 permissions: {}
 
@@ -90,6 +100,7 @@ jobs:
       actions: read # to find the build run of the release commit
     outputs:
       digest: ${{ steps.tag.outputs.digest }}
+      digests: ${{ steps.tag.outputs.digests }}
     steps:
       - name: Wait for the release commit's build
         env:
@@ -135,35 +146,61 @@ jobs:
         env:
           SHA: ${{ needs.release-please.outputs.sha }}
           VERSION: ${{ needs.release-please.outputs.version }}
+          IMAGES: ${{ inputs.images }}
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          src="$image:sha-${SHA::7}"
-          dst="$image:$VERSION"
           digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
-
           set -o pipefail
-          want=$(digest_of "$src")
-          if [ -z "$want" ] || [ "$want" = null ]; then
-            echo "::error::$src not found in GHCR, although its build succeeded."
-            exit 1
+
+          # Every image is checked before any is tagged, so a missing one leaves the release untagged
+          # instead of half promoted.
+          if [ -z "${IMAGES//[[:space:]]/}" ]; then
+            refs=("ghcr.io/${GITHUB_REPOSITORY,,}")
+          else
+            refs=()
+            for name in $IMAGES; do
+              name=${name,,}
+              if ! [[ "$name" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+                echo "::error::image '$name' is not a valid package name."
+                exit 1
+              fi
+              refs+=("ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$name")
+            done
           fi
-          # A version tag is never moved: if it exists already, it must be this exact image.
-          if have=$(digest_of "$dst" 2>/dev/null) && [ -n "$have" ]; then
-            if [ "$have" != "$want" ]; then
-              echo "::error::$dst already exists as $have, not $want. Version tags are never moved."
+
+          declare -A want
+          for image in "${refs[@]}"; do
+            src="$image:sha-${SHA::7}"
+            want[$image]=$(digest_of "$src")
+            if [ -z "${want[$image]}" ] || [ "${want[$image]}" = null ]; then
+              echo "::error::$src not found in GHCR, although its build succeeded."
               exit 1
             fi
-            echo "$dst already points to $want."
-          else
-            # By digest, not by the sha- tag: exactly the image checked above gets the version, even if
-            # the sha- tag were re-pushed in between.
-            docker buildx imagetools create --tag "$dst" "$image@$want"
-          fi
+          done
 
-          got=$(digest_of "$dst")
-          if [ "$got" != "$want" ]; then
-            echo "::error::$dst is $got after tagging, expected $want."
-            exit 1
-          fi
-          echo "digest=$want" >> "$GITHUB_OUTPUT"
-          echo "Released \`$dst@$want\` (built as \`$src\`)" >> "$GITHUB_STEP_SUMMARY"
+          digests='{}'
+          for image in "${refs[@]}"; do
+            src="$image:sha-${SHA::7}"
+            dst="$image:$VERSION"
+            # A version tag is never moved: if it exists already, it must be this exact image.
+            if have=$(digest_of "$dst" 2>/dev/null) && [ -n "$have" ]; then
+              if [ "$have" != "${want[$image]}" ]; then
+                echo "::error::$dst already exists as $have, not ${want[$image]}. Version tags are never moved."
+                exit 1
+              fi
+              echo "$dst already points to ${want[$image]}."
+            else
+              # By digest, not by the sha- tag: exactly the image checked above gets the version, even if
+              # the sha- tag were re-pushed in between.
+              docker buildx imagetools create --tag "$dst" "$image@${want[$image]}"
+            fi
+
+            got=$(digest_of "$dst")
+            if [ "$got" != "${want[$image]}" ]; then
+              echo "::error::$dst is $got after tagging, expected ${want[$image]}."
+              exit 1
+            fi
+            digests=$(jq -c --arg k "${image##*/}" --arg v "$got" '. + {($k): $v}' <<<"$digests")
+            echo "Released \`$dst@$got\` (built as \`$src\`)" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "digest=${want[${refs[0]}]}" >> "$GITHUB_OUTPUT"
+          echo "digests=$digests" >> "$GITHUB_OUTPUT"
