@@ -9,8 +9,8 @@ the step-by-step guide is
 | Workflow | Called on | Does |
 |---|---|---|
 | [`semantic-pr.yml`](.github/workflows/semantic-pr.yml) | every PR | Fails unless the PR title is a Conventional Commit (`feat: …`, `fix(api): …`). Make it a required check. |
-| [`build.yml`](.github/workflows/build.yml) | push to `main` | Builds the image and pushes `ghcr.io/<owner>/<repo>:sha-<7-char commit>`. Outputs `image`, `tag`, `digest`. |
-| [`release.yml`](.github/workflows/release.yml) | push to `main` | release-please's release PR (version + `CHANGELOG.md`). When that PR is merged: waits for the release commit's build, then tags that same digest `X.Y.Z`. |
+| [`build.yml`](.github/workflows/build.yml) | push to `main` | Builds the image and pushes `ghcr.io/<owner>/<repo>:sha-<7-char commit>`, or `ghcr.io/<owner>/<image-name>` when `image-name` is set (call it once per image for a repo with more than one). Outputs `image`, `tag`, `digest`. |
+| [`release.yml`](.github/workflows/release.yml) | push to `main` | release-please's release PR (version + `CHANGELOG.md`). When that PR is merged: waits for the release commit's build, then tags that same digest `X.Y.Z`. `images` lists the package names to promote when the repo builds more than one; every image is checked before any is tagged. |
 | [`request-deploy.yml`](.github/workflows/request-deploy.yml) | after `build` (staging) or a release (production) | Asks `kthaisociety/deployments`' `deploy.yml` (with the `kthais-dispatch` App) to deploy a tag to one environment, and waits: green only once the app runs it. Opting in is adding the job, per environment. |
 
 ## Using them

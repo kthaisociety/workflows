@@ -151,8 +151,9 @@ jobs:
           digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
           set -o pipefail
 
-          # Every image is checked before any is tagged, so a missing one leaves the release untagged
-          # instead of half promoted.
+          # Every image is checked before any is tagged, so a missing one leaves the release untagged. If
+          # tagging fails partway, the images before it already have the version; a rerun finishes the
+          # rest, since a version tag that already points to the same image is accepted.
           if [ -z "${IMAGES//[[:space:]]/}" ]; then
             refs=("ghcr.io/${GITHUB_REPOSITORY,,}")
           else
